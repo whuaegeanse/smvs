@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, Fabian Langguth
+ * Copyright (c) 2016-2017, Fabian Langguth
  * TU Darmstadt - Graphics, Capture and Massively Parallel Computing
  * All rights reserved.
  *
@@ -10,6 +10,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <vector>
+#include <set>
 #include <string>
 
 #include "mve/scene.h"
@@ -44,26 +45,29 @@ struct AppSettings
     int debug_lvl = 0;
     std::size_t num_neighbors = 6;
     std::size_t min_neighbors = 3;
-    std::size_t num_threads;
+    std::size_t max_pixels = 1700000;
+    std::size_t num_threads = std::thread::hardware_concurrency();
     bool use_shading = false;
     float light_surf_regularization = 0.0f;
     bool gamma_correction = false;
     bool recon_only = false;
     bool cut_surface = true;
-    float simplify = 0.0f;
     bool create_triangle_mesh = false;
+    std::string aabb_string = "";
+    bool simplify = false;
     bool use_sgm = true;
     float sgm_min = 0.0f;
     float sgm_max = 0.0f;
+    int sgm_scale = 1;
     std::string sgm_range = "";
     bool force_recon = false;
     bool force_sgm = false;
+    bool full_optimization = false;
     bool clean_scene = false;
+    math::Vec3f aabb_min = math::Vec3f(0.0f);
+    math::Vec3f aabb_max = math::Vec3f(0.0f);
 
-    AppSettings (void)
-    {
-        num_threads = std::thread::hardware_concurrency();
-    }
+    AppSettings (void) {}
 };
 
 AppSettings
@@ -94,6 +98,9 @@ args_to_settings(int argc, char** argv)
     args.add_option('d', "debug-lvl", true, "Debug level [0]");
     args.add_option('r', "recon-only", false, "Generate only depth maps "
         "and no output ply. [off]");
+    args.add_option('M', "max-pixels", true, "Maximal number of "
+        "pixels for reconstruction. Images will be rescaled "
+        "to be below this value. [1700000]");
     args.add_option('S', "shading", false, "Use shading-based optimization. "
         "[off]");
     args.add_option('R', "regularize-lighting", true, "Use additional basic "
@@ -104,22 +111,28 @@ args_to_settings(int argc, char** argv)
         " correction. [off]");
     args.add_option('m', "mesh", false, "Create Triangle mesh "
         "instead of simple point cloud (WIP). [off]");
+    args.add_option('y', "simplify", false, "Create simplified triangle mesh "
+        "(WIP). [off]");
+    args.add_option('f', "force", false, "Force reconstruction of "
+        "result embeddings");
     args.add_option('\0', "no-cut", false, "Turn off surface cutting and"
         " export fill pointcloud from all depth values. [on]");
-    args.add_option('\0', "simplify", true, "Simplify triangle mesh "
-        "(WIP). Given as percentage [100 = keep everything]");
+    args.add_option('\0', "aabb", true, "Comma separated AABB for output: "
+        "min,min,min,max,max,max");
     args.add_option('\0', "min-neighbors", true, "Minimal number of "
         "neighbors for reconstruction. [3]");
-    args.add_option('\0', "force", false, "Force reconstruction of "
-        "result embeddings");
     args.add_option('\0', "no-sgm", false, "Turn off semi-global "
         "matching.");
     args.add_option('\0', "force-sgm", false, "Force reconstruction of "
         "SGM embeddings.");
+    args.add_option('\0', "sgm-scale", true, "Scale of reconstruction of "
+        "SGM embeddings relative to input scale. [1]");
     args.add_option('\0', "sgm-range", true, "Range for SGM depth sweep, "
-        "given as string \"0.1,3.5\" "
+        "given as string \"0.1,3.5\". "
         "[estimated from SfM pointcloud] "
         "(this option is untested please report any issues)");
+    args.add_option('\0', "full-opt", false, "Run full optimization "
+        "on all nodes (otherwise it only runs on non converged nodes) [off]");
     args.add_option('\0', "clean", false, "Clean scene and remove all "
         "result embeddings");
 
@@ -153,8 +166,10 @@ args_to_settings(int argc, char** argv)
             conf.debug_lvl = arg->get_arg<unsigned int>();
         else if (arg->opt->lopt == "min-neighbors")
             conf.min_neighbors = arg->get_arg<std::size_t>();
+        else if (arg->opt->lopt == "max-pixels")
+            conf.max_pixels = arg->get_arg<std::size_t>();
         else if (arg->opt->lopt == "simplify")
-            conf.simplify = arg->get_arg<float>();
+            conf.simplify = true;
         else if (arg->opt->lopt == "shading")
             conf.use_shading = true;
         else if (arg->opt->lopt == "regularize-lighting")
@@ -165,6 +180,8 @@ args_to_settings(int argc, char** argv)
             conf.recon_only = true;
         else if (arg->opt->lopt == "mesh")
             conf.create_triangle_mesh = true;
+        else if (arg->opt->lopt == "aabb")
+            conf.aabb_string = arg->arg;
         else if (arg->opt->lopt == "force")
             conf.force_recon = true;
         else if (arg->opt->lopt == "no-cut")
@@ -173,8 +190,12 @@ args_to_settings(int argc, char** argv)
             conf.use_sgm = false;
         else if (arg->opt->lopt == "force-sgm")
             conf.force_sgm = true;
+        else if (arg->opt->lopt == "sgm-scale")
+            conf.sgm_scale = arg->get_arg<int>();
         else if (arg->opt->lopt == "sgm-range")
             conf.sgm_range = arg->arg;
+        else if (arg->opt->lopt == "full-opt")
+            conf.full_optimization = true;
         else if (arg->opt->lopt == "clean")
             conf.clean_scene = true;
         else
@@ -182,12 +203,21 @@ args_to_settings(int argc, char** argv)
     }
 
     /* Process and cleanup arguments */
+    if (conf.num_neighbors < 1)
+    {
+        std::cout << "[Warning] Need at least 1 neighbor for reconstruction, "
+            << "setting num-neighbors to 1." << std::endl;
+        conf.num_neighbors = 1;
+    }
+    conf.min_neighbors = std::min(conf.min_neighbors, conf.num_neighbors);
+
     if (conf.min_neighbors < 1)
     {
         std::cout << "[Warning] Need at least 1 neighbor for reconstruction, "
             << "setting min-neighbors to 1." << std::endl;
         conf.min_neighbors = 1;
     }
+
     if (conf.output_scale < 1)
     {
         std::cout << "[Warning] Output scale cannot be smaller than 1, "
@@ -195,13 +225,9 @@ args_to_settings(int argc, char** argv)
         conf.output_scale = 1;
     }
 
-    if (!conf.create_triangle_mesh && conf.simplify > 0.0f)
-        std::cout << "[Warning] Only mesh output can be simplified. "
-            << "Ignoring simplify argument!" << std::endl;
-
-    if (conf.create_triangle_mesh && !conf.cut_surface)
-        std::cout << "[Warning] Turning surface cutting off for mesh output"
-            << " is not the best idea - the mesh will be huge!" << std::endl;
+    if (conf.create_triangle_mesh && !conf.cut_surface && !conf.simplify)
+        std::cout << "[Warning] Turning surface cutting off for unsimplified"
+            << " mesh output might create a huge file." << std::endl;
 
     if (conf.sgm_range.size() > 0)
     {
@@ -214,6 +240,22 @@ args_to_settings(int argc, char** argv)
         }
         conf.sgm_min = tok.get_as<float>(0);
         conf.sgm_max = tok.get_as<float>(1);
+    }
+
+    if (conf.aabb_string.size() > 0)
+    {
+        util::Tokenizer tok;
+        tok.split(conf.aabb_string, ',');
+        if (tok.size() != 6)
+        {
+            std::cerr << "Error: AABB invalid" << std::endl;
+            std::exit(EXIT_FAILURE);
+        }
+        for (int i = 0; i < 3; ++i)
+        {
+            conf.aabb_min[i] = tok.get_as<float>(i);
+            conf.aabb_max[i] = tok.get_as<float>(i + 3);
+        }
     }
 
     if (conf.force_sgm && !conf.use_sgm)
@@ -261,18 +303,38 @@ void generate_mesh (AppSettings const& conf, mve::Scene::Ptr scene,
     mve::TriangleMesh::Ptr mesh = meshgen.generate_mesh(recon_views,
         input_name, dm_name);
 
+    if (conf.aabb_string.size() > 0)
+    {
+        std::cout << "Clipping to AABB: (" << conf.aabb_min << ") / ("
+            << conf.aabb_max << ")" << std::endl;
+
+        mve::TriangleMesh::VertexList const& verts = mesh->get_vertices();
+        std::vector<bool> aabb_clip(verts.size(), false);
+        for (std::size_t v = 0; v < verts.size(); ++v)
+            for (int i = 0; i < 3; ++i)
+                if (verts[v][i] < conf.aabb_min[i]
+                    || verts[v][i] > conf.aabb_max[i])
+                    aabb_clip[v] = true;
+        mesh->delete_vertices_fix_faces(aabb_clip);
+    }
+
     std::cout << "Done. Took: " << timer.get_elapsed_sec() << "s" << std::endl;
 
     if (conf.create_triangle_mesh)
         mesh->recalc_normals();
 
-    std::string meshname;
+    /* Build mesh name */
+    std::string meshname = "smvs-";
+    if (conf.create_triangle_mesh)
+        meshname += "m-";
     if (conf.use_shading)
-        meshname =
-            util::fs::join_path(scene->get_path(), "smvs-S.ply");
+        meshname += "S";
     else
-        meshname =
-            util::fs::join_path(scene->get_path(), "smvs-B.ply");
+        meshname += "B";
+    meshname += util::string::get(conf.input_scale) + ".ply";
+    meshname = util::fs::join_path(scene->get_path(), meshname);
+
+    /* Save mesh */
     mve::geom::SavePLYOptions opts;
     opts.write_vertex_normals = true;
     opts.write_vertex_values = true;
@@ -288,7 +350,7 @@ void reconstruct_sgm_depth_for_view (AppSettings const& conf,
     mve::Bundle::ConstPtr bundle = nullptr)
 {
     smvs::SGMStereo::Options sgm_opts;
-    sgm_opts.scale = 1;
+    sgm_opts.scale = conf.sgm_scale;
     sgm_opts.num_steps = 128;
     sgm_opts.debug_lvl = conf.debug_lvl;
     sgm_opts.min_depth = conf.sgm_min;
@@ -316,18 +378,15 @@ void reconstruct_sgm_depth_for_view (AppSettings const& conf,
             if (min / max < 0.95)
                 d1->at(p) = 0.0f;
             else
-                d1->at(p) = (d1->at(p) + d2->at(p)) * 0.5;
+                d1->at(p) = std::min(d1->at(p) , d2->at(p));
         }
     }
-    mve::FloatImage::Ptr init = mve::FloatImage::create(
-        main_view->get_width(), main_view->get_height(), 1);
-    mve::image::rescale_nearest<float>(d1, init);
 
     if (conf.debug_lvl > 0)
         std::cout << "SGM took: " << sgm_timer.get_elapsed_sec()
         << "sec" << std::endl;
 
-    main_view->write_depth_to_view(init, "sgm-depth");
+    main_view->write_depth_to_view(d1, "smvs-sgm");
 }
 
 /* -------------------------------------------------------------------------- */
@@ -344,8 +403,7 @@ main (int argc, char** argv)
     /* Start processing */
 
     /* Load scene */
-    mve::Scene::Ptr scene(mve::Scene::create());
-    scene->load_scene(conf.scene_dname);
+    mve::Scene::Ptr scene = mve::Scene::create(conf.scene_dname);
     mve::Scene::ViewList& views(scene->get_views());
 
     /* Check bundle file */
@@ -374,6 +432,31 @@ main (int argc, char** argv)
             if (view != nullptr && view->is_camera_valid())
                 conf.view_ids.push_back(view->get_id());
 
+    /* Update legacy data */
+    for (std::size_t i = 0; i < views.size(); ++i)
+    {
+        mve::View::Ptr view = views[i];
+        if (view == nullptr)
+            continue;
+        mve::View::ImageProxies proxies = view->get_images();
+        for (std::size_t p = 0; p < proxies.size(); ++p)
+            if (proxies[p].name.compare("lighting-shaded") == 0
+                || proxies[p].name.compare("lighting-sphere") == 0
+                || proxies[p].name.compare("implicit-albedo") == 0)
+                view->remove_image(proxies[p].name);
+        view->save_view();
+        for (std::size_t p = 0; p < proxies.size(); ++p)
+            if (proxies[p].name.compare("sgm-depth") == 0)
+            {
+                std::string file = util::fs::join_path(
+                    view->get_directory(), proxies[p].filename);
+                std::string new_file = util::fs::join_path(
+                   view->get_directory(), "smvs-sgm.mvei");
+                util::fs::rename(file.c_str(), new_file.c_str());
+            }
+        view->reload_view();
+    }
+
     if (conf.clean_scene)
     {
         std::cout << "Cleaning Scene, removing all result embeddings."
@@ -388,11 +471,7 @@ main (int argc, char** argv)
             {
                 std::string name = proxies[p].name;
                 std::string left = util::string::left(name, 4);
-                if (left.compare("smvs") == 0
-                    || name.compare("sgm-depth") == 0
-                    || name.compare("lighting-shaded") == 0
-                    || name.compare("lighting-sphere") == 0
-                    || name.compare("implicit-albedo") == 0)
+                if (left.compare("smvs") == 0)
                     view->remove_image(name);
             }
             view->save_view();
@@ -419,14 +498,14 @@ main (int argc, char** argv)
         }
         avg_image_size /= static_cast<double>(view_counter);
         
-        int const max_image_size = 1.7e6;
-        if (avg_image_size > max_image_size)
+        if (avg_image_size > conf.max_pixels)
             conf.input_scale = std::ceil(std::log2(
-                avg_image_size / max_image_size) / 2);
+                avg_image_size / conf.max_pixels) / 2);
         else
             conf.input_scale = 0;
         std::cout << "Automatic input scale: " << conf.input_scale << std::endl;
     }
+
     std::string input_name;
     if (conf.input_scale > 0)
         input_name = "undist-L" + util::string::get(conf.input_scale);
@@ -441,25 +520,36 @@ main (int argc, char** argv)
         output_name = "smvs-B" + util::string::get(conf.input_scale);
     std::cout << "Output embedding: " << output_name << std::endl;
 
+    /* Clean view id list */
+    std::vector<int> ignore_list;
+    for (std::size_t v = 0; v < conf.view_ids.size(); ++v)
+    {
+        int const i = conf.view_ids[v];
+        if (i > static_cast<int>(views.size() - 1) || views[i] == nullptr)
+        {
+            std::cout << "View ID " << i << " invalid, skipping view."
+                << std::endl;
+            ignore_list.push_back(i);
+            continue;
+        }
+        if (!views[i]->has_image(conf.image_embedding))
+        {
+            std::cout << "View ID " << i << " missing image embedding, "
+                << "skipping view." << std::endl;
+            ignore_list.push_back(i);
+            continue;
+        }
+    }
+    for (auto const& id : ignore_list)
+        conf.view_ids.erase(std::remove(conf.view_ids.begin(),
+            conf.view_ids.end(), id));
+
     /* Add views to reconstruction list */
     std::vector<int> reconstruction_list;
     int already_reconstructed = 0;
     for (std::size_t v = 0; v < conf.view_ids.size(); ++v)
     {
         int const i = conf.view_ids[v];
-        if (views[i] == nullptr)
-        {
-            std::cout << "View ID " << i << " invalid, skipping view."
-            << std::endl;
-            continue;
-        }
-        if (!views[i]->has_image(conf.image_embedding))
-        {
-            std::cout << "View ID " << i << " missing image embedding, "
-            << "skipping view." << std::endl;
-            continue;
-        }
-
         /* Only reconstruct missing views or if forced */
         if (conf.force_recon || !views[i]->has_image(output_name))
             reconstruction_list.push_back(i);
@@ -468,43 +558,108 @@ main (int argc, char** argv)
     }
     if (already_reconstructed > 0)
         std::cout << "Skipping " << already_reconstructed
-        << " views that are already reconstructed." << std::endl;
+            << " views that are already reconstructed." << std::endl;
 
     /* Create reconstruction threads */
-    ThreadPool thread_pool(std::max<std::size_t>(std::min(conf.num_threads,
-        reconstruction_list.size()), 1));
+    ThreadPool thread_pool(std::max<std::size_t>(conf.num_threads, 1));
 
-    /* Create input embedding */
-    std::vector<std::future<void>> resize;
-    for (std::size_t i = 0; i < views.size(); ++i)
-    resize.emplace_back(thread_pool.add_task(
-        [i, &views, &input_name, &conf]
+    /* View selection */
+    smvs::ViewSelection::Options view_select_opts;
+    view_select_opts.num_neighbors = conf.num_neighbors;
+    view_select_opts.embedding = conf.image_embedding;
+    smvs::ViewSelection view_selection(view_select_opts, views, bundle);
+    std::vector<mve::Scene::ViewList> view_neighbors(
+        reconstruction_list.size());
+    std::vector<std::future<void>> selection_tasks;
+    for (std::size_t v = 0; v < reconstruction_list.size(); ++v)
+    {
+        int const i = reconstruction_list[v];
+        selection_tasks.emplace_back(thread_pool.add_task(
+            [i, v, &views, &view_selection, &view_neighbors]
+        {
+            view_neighbors[v] = view_selection.get_neighbors_for_view(i);
+        }));
+    }
+    if (selection_tasks.size() > 0)
+    {
+        std::cout << "Running view selection for "
+            << selection_tasks.size() << " views... " << std::flush;
+        util::WallTimer timer;
+        for(auto && task : selection_tasks) task.get();
+        std::cout << " done, took " << timer.get_elapsed_sec()
+            << "s." << std::endl;
+    }
+    std::vector<int> skipped;
+    std::vector<int> final_reconstruction_list;
+    std::vector<mve::Scene::ViewList> final_view_neighbors;
+    for (std::size_t v = 0; v < reconstruction_list.size(); ++v)
+        if (view_neighbors[v].size() < conf.min_neighbors)
+            skipped.push_back(reconstruction_list[v]);
+        else
+        {
+            final_reconstruction_list.push_back(reconstruction_list[v]);
+            final_view_neighbors.push_back(view_neighbors[v]);
+        }
+    if (skipped.size() > 0)
+    {
+        std::cout << "Skipping " << skipped.size() << " views with "
+            << "insufficient number of neighbors." << std::endl;
+        std::cout << "Skipped IDs: ";
+        for (std::size_t s = 0; s < skipped.size(); ++s)
+        {
+            std::cout << skipped[s] << " ";
+            if (s > 0 && s % 12 == 0)
+                std::cout << std::endl << "     ";
+        }
+        std::cout << std::endl;
+    }
+    reconstruction_list = final_reconstruction_list;
+    view_neighbors = final_view_neighbors;
+
+    /* Create input embedding and resize */
+    std::set<int> check_embedding_list;
+    for (std::size_t v = 0; v < reconstruction_list.size(); ++v)
+    {
+        check_embedding_list.insert(reconstruction_list[v]);
+        for (auto & neighbor : view_neighbors[v])
+            check_embedding_list.insert(neighbor->get_id());
+    }
+    std::vector<std::future<void>> resize_tasks;
+    for (auto const& i : check_embedding_list)
     {
         mve::View::Ptr view = views[i];
         if (view == nullptr
             || !view->has_image(conf.image_embedding)
             || view->has_image(input_name))
-            return;
+            continue;
 
-        mve::ByteImage::ConstPtr input =
-            view->get_byte_image(conf.image_embedding);
-        mve::ByteImage::Ptr scaled = input->duplicate();
-        for (int i = 0; i < conf.input_scale; ++i)
-            scaled = mve::image::rescale_half_size_gaussian<uint8_t>(scaled);
-        view->set_image(scaled, input_name);
-        view->save_view();
-    }));
-    for(auto && resized: resize) resized.get();
+        resize_tasks.emplace_back(thread_pool.add_task(
+            [view, &input_name, &conf]
+        {
+            mve::ByteImage::ConstPtr input =
+                view->get_byte_image(conf.image_embedding);
+            mve::ByteImage::Ptr scld = input->duplicate();
+            for (int i = 0; i < conf.input_scale; ++i)
+                scld = mve::image::rescale_half_size_gaussian<uint8_t>(scld);
+            view->set_image(scld, input_name);
+            view->save_view();
+        }));
+    }
+    if (resize_tasks.size() > 0)
+    {
+        std::cout << "Resizing input images for "
+            << resize_tasks.size() << " views... " << std::flush;
+        util::WallTimer timer;
+        for(auto && task : resize_tasks) task.get();
+        std::cout << " done, took " << timer.get_elapsed_sec()
+            << "s." << std::endl;
+    }
 
     std::vector<std::future<void>> results;
     std::mutex counter_mutex;
     std::size_t started = 0;
     std::size_t finished = 0;
     util::WallTimer timer;
-    smvs::ViewSelection::Options view_select_opts;
-    view_select_opts.num_neighbors = conf.num_neighbors;
-    view_select_opts.embedding = input_name;
-    smvs::ViewSelection view_selection(view_select_opts, views, bundle);
 
     for (std::size_t v = 0; v < reconstruction_list.size(); ++v)
     {
@@ -512,24 +667,13 @@ main (int argc, char** argv)
 
         results.emplace_back(thread_pool.add_task(
             [v, i, &views, &conf, &counter_mutex, &input_name, &output_name,
-             &started, &finished, &reconstruction_list, &view_selection,
+             &started, &finished, &reconstruction_list, &view_neighbors,
              bundle, scene]
         {
-            smvs::StereoView::Ptr main_view = smvs::StereoView::create(views[i],
-                input_name, conf.gamma_correction);
-
-            mve::Scene::ViewList neighbors =
-                view_selection.get_neighbors_for_view(i);
-
-            if (neighbors.size() < conf.min_neighbors)
-            {
-                std::unique_lock<std::mutex> lock2(counter_mutex);
-                std::cout << "View ID: " << i << " not enough neighbors, "
-                    "skipping view." << std::endl;
-                finished += 1;
-                lock2.unlock();
-                return;
-            }
+            smvs::StereoView::Ptr main_view = smvs::StereoView::create(
+                views[i], input_name, conf.use_shading,
+                conf.gamma_correction);
+            mve::Scene::ViewList neighbors = view_neighbors[v];
 
             std::vector<smvs::StereoView::Ptr> stereo_views;
 
@@ -548,18 +692,27 @@ main (int argc, char** argv)
                 && n < neighbors.size() ; ++n)
             {
                 smvs::StereoView::Ptr sv = smvs::StereoView::create(
-                    neighbors[n], input_name, conf.gamma_correction);
+                    neighbors[n], input_name);
                 stereo_views.push_back(sv);
             }
 
             if (conf.use_sgm)
-                if (conf.force_sgm || !views[i]->has_image("sgm-depth")
-                    || views[i]->get_image_proxy("sgm-depth")->width !=
-                    views[i]->get_image_proxy(input_name)->width
-                    || views[i]->get_image_proxy("sgm-depth")->height !=
-                    views[i]->get_image_proxy(input_name)->height)
+            {
+                int sgm_width = views[i]->get_image_proxy(input_name)->width;
+                int sgm_height = views[i]->get_image_proxy(input_name)->height;
+                for (int scale = 0; scale < conf.sgm_scale; ++scale)
+                {
+                    sgm_width = (sgm_width + 1) / 2;
+                    sgm_height = (sgm_height + 1) / 2;
+                }
+                if (conf.force_sgm || !views[i]->has_image("smvs-sgm")
+                    || views[i]->get_image_proxy("smvs-sgm")->width !=
+                        sgm_width
+                    || views[i]->get_image_proxy("smvs-sgm")->height !=
+                        sgm_height)
                     reconstruct_sgm_depth_for_view(conf, main_view,
                         stereo_views, bundle);
+            }
 
             smvs::DepthOptimizer::Options do_opts;
             do_opts.regularization = 0.01 * conf.regularization;
@@ -569,6 +722,7 @@ main (int argc, char** argv)
             do_opts.use_shading = conf.use_shading;
             do_opts.output_name = output_name;
             do_opts.use_sgm = conf.use_sgm;
+            do_opts.full_optimization = conf.full_optimization;
             do_opts.light_surf_regularization = conf.light_surf_regularization;
 
             smvs::DepthOptimizer optimizer(main_view, stereo_views,

@@ -22,10 +22,12 @@ class StereoView
 {
 public:
     typedef std::shared_ptr<StereoView> Ptr;
+    typedef std::shared_ptr<const StereoView> ConstPtr;
 
 public:
     static StereoView::Ptr create (mve::View::Ptr view,
-        std::string const& image_embedding, bool gamma_correction);
+        std::string const& image_embedding, bool initialize_linear = false,
+        bool gamma_correction = false);
 
     void set_scale(int scale, bool debug = false);
 
@@ -37,12 +39,13 @@ public:
     float get_inverse_flen (void) const;
     mve::ByteImage::ConstPtr get_byte_image (void) const;
     mve::FloatImage::ConstPtr get_image (void) const;
+    mve::FloatImage::ConstPtr get_scaleimage (void) const;
     mve::FloatImage::ConstPtr get_image_gradients (void) const;
     mve::FloatImage::ConstPtr get_image_hessian (void) const;
     mve::FloatImage::Ptr get_sgm_depth (void) const;
-    mve::FloatImage::Ptr get_shading_image (void);
+    mve::FloatImage::ConstPtr get_shading_image (void) const;
+    mve::FloatImage::ConstPtr get_shading_gradients (void) const;
     mve::FloatImage::ConstPtr get_linear_image (void) const;
-    mve::FloatImage::ConstPtr get_linear_gradients (void) const;
 
     void write_image_to_view (mve::ImageBase::Ptr image,
         std::string const& name);
@@ -50,10 +53,8 @@ public:
     void write_depth_to_view (mve::FloatImage::Ptr depth,
         std::string const& name);
 
-#if SMVS_DEBUG
-    mve::FloatImage::Ptr get_debug_image (void) {return this->debug;}
+    mve::FloatImage::Ptr get_debug_image (void);
     void write_debug (int num = 0);
-#endif
 
 private:
     StereoView (mve::View::Ptr view, std::string const& image_embedding);
@@ -68,14 +69,13 @@ private:
     mve::View::Ptr view;
     std::string const image_embedding;
     mve::FloatImage::ConstPtr image;
+    mve::FloatImage::Ptr scaleimage;
     mve::FloatImage::Ptr image_grad;
     mve::FloatImage::Ptr image_hessian;
     mve::FloatImage::Ptr linear_image;
-    mve::FloatImage::Ptr linear_grad;
-
-#if SMVS_DEBUG
     mve::FloatImage::Ptr debug;
-#endif
+    mve::FloatImage::Ptr shading;
+    mve::FloatImage::Ptr shading_grad;
 };
 
 /* ------------------------ Implementation ------------------------ */
@@ -83,22 +83,13 @@ private:
 inline
 StereoView::Ptr
 StereoView::create(mve::View::Ptr view, const std::string &image_embedding,
-    bool gamma_correction)
+    bool initialize_linear, bool gamma_correction)
 {
     Ptr stereo_view(new StereoView(view, image_embedding));
-    stereo_view->initialize_linear(gamma_correction);
+    if (initialize_linear)
+        stereo_view->initialize_linear(gamma_correction);
     return stereo_view;
 }
-
-#if SMVS_DEBUG
-inline void
-StereoView::write_debug (int num)
-{
-    std::string name = "smvs-debug-" + util::string::get_filled(num, 2);
-    this->view->set_image(this->debug, name);
-    this->view->save_view();
-}
-#endif
 
 inline void
 StereoView::write_image_to_view(mve::ImageBase::Ptr image,
@@ -127,11 +118,10 @@ StereoView::write_depth_to_view(mve::FloatImage::Ptr depth,
     this->view->save_view();
 }
 
-inline
-mve::FloatImage::Ptr
+inline mve::FloatImage::Ptr
 StereoView::get_sgm_depth (void) const
 {
-    mve::FloatImage::Ptr mve_depth = this->view->get_float_image("sgm-depth");
+    mve::FloatImage::Ptr mve_depth = this->view->get_float_image("smvs-sgm");
     math::Matrix3f invproj;
     this->get_camera().fill_inverse_calibration(
         *invproj, mve_depth->width(), mve_depth->height());
@@ -165,6 +155,12 @@ StereoView::get_image (void) const
 }
 
 inline mve::FloatImage::ConstPtr
+StereoView::get_scaleimage (void) const
+{
+    return this->scaleimage;
+}
+
+inline mve::FloatImage::ConstPtr
 StereoView::get_image_gradients (void) const
 {
     return this->image_grad;
@@ -183,9 +179,15 @@ StereoView::get_linear_image (void) const
 }
 
 inline mve::FloatImage::ConstPtr
-StereoView::get_linear_gradients (void) const
+StereoView::get_shading_image (void) const
 {
-    return this->linear_grad;
+    return this->shading;
+}
+
+inline mve::FloatImage::ConstPtr
+StereoView::get_shading_gradients (void) const
+{
+    return this->shading_grad;
 }
 
 inline int
@@ -204,6 +206,26 @@ inline int
 StereoView::get_view_id (void) const
 {
     return this->view->get_id();
+}
+
+/********************************* Debug **************************************/
+
+inline mve::FloatImage::Ptr
+StereoView::get_debug_image (void)
+{
+    if (this->debug == nullptr)
+        this->debug = mve::FloatImage::create(this->image->width(),
+            this->image->height(), 3);
+    return this->debug;
+}
+
+inline void
+StereoView::write_debug (int num)
+{
+    std::string name = "smvs-debug-" + util::string::get_filled(num, 2);
+    this->view->set_image(this->debug, name);
+    this->view->save_view();
+    this->view->cache_cleanup();
 }
 
 SMVS_NAMESPACE_END

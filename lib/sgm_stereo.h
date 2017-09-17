@@ -30,7 +30,7 @@ public:
         float min_depth = 0.0f;
         float max_depth = 0.0f;
         uint16_t penalty1 = 24;
-        uint16_t penalty2 = 1000;
+        uint16_t penalty2 = 4000;
     };
 
     SGMStereo (Options const& opts,
@@ -43,8 +43,11 @@ public:
     mve::FloatImage::Ptr run_sgm (float min_depth, float max_depth);
 
 private:
-    void warped_l_image_for_depth (float depth, mve::ByteImage::Ptr image);
-    mve::Image<uint64_t>::Ptr census_filter (mve::ByteImage::ConstPtr image);
+    void warped_neighbors_for_depth (std::vector<float> const& depths,
+        mve::ByteImage::Ptr image);
+
+    void census_filter (mve::ByteImage::ConstPtr image,
+        mve::Image<uint64_t>::Ptr filtered);
 
     void create_cost_volume (float min_depth, float max_depth, int num_steps);
 
@@ -68,9 +71,10 @@ private:
 private:
     Options opts;
 
-    StereoView::Ptr left;
-    StereoView::Ptr right;
-    mve::ByteImage::ConstPtr r_image;
+    StereoView::Ptr main;
+    StereoView::Ptr neighbor;
+    mve::ByteImage::ConstPtr main_image;
+    mve::ByteImage::ConstPtr neighbor_image;
 
     mve::ByteImage::Ptr cost_volume;
     mve::RawImage::Ptr sgm_volume;

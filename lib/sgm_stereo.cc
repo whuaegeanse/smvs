@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, Fabian Langguth
+ * Copyright (c) 2016-2017, Fabian Langguth
  * TU Darmstadt - Graphics, Capture and Massively Parallel Computing
  * All rights reserved.
  *
@@ -9,6 +9,11 @@
 
 #include <iostream>
 #include <smmintrin.h> // SSE4_1
+#if defined(_WIN32)
+#   include <nmmintrin.h> // for hamming distance
+#else // Linux, OSX, ...
+#   include <popcntintrin.h> // for hamming distance
+#endif
 
 #include "mve/depthmap.h"
 #include "mve/image_tools.h"
@@ -21,11 +26,17 @@ SMVS_NAMESPACE_BEGIN
 
 SGMStereo::SGMStereo (Options const& opts, StereoView::Ptr main,
     StereoView::Ptr neighbor)
-    : opts(opts), left(neighbor), right(main)
+    : opts(opts), main(main), neighbor(neighbor)
 {
-    this->r_image = this->right->get_byte_image();
+    this->main_image = this->main->get_byte_image();
     for (int i = 0; i < this->opts.scale; ++i)
-        this->r_image = mve::image::rescale_half_size<uint8_t>(this->r_image);
+        this->main_image = mve::image::rescale_half_size<uint8_t>(
+            this->main_image);
+
+    this->neighbor_image = this->neighbor->get_byte_image();
+    for (int i = 0; i < this->opts.scale; ++i)
+        this->neighbor_image = mve::image::rescale_half_size<uint8_t>(
+            this->neighbor_image);
 
     this->cost_updates.resize(opts.num_steps);
     this->min_cost_updates.resize(opts.num_steps);
@@ -57,6 +68,7 @@ SGMStereo::reconstruct (SGMStereo::Options sgm_opts, StereoView::Ptr main_view,
     main_cam.fill_reprojection(neighbor_cam, d_main->width(),
         d_main->height(), d_neig->width(), d_neig->height(), *M, *t);
 
+    int const cut = 0.03 * std::max(d_neig->width(), d_neig->height());
     for (int x = 0; x < d_main->width(); ++x)
         for (int y = 0; y < d_main->height(); ++y)
         {
@@ -65,8 +77,8 @@ SGMStereo::reconstruct (SGMStereo::Options sgm_opts, StereoView::Ptr main_view,
             Correspondence c(M, t, x, y, d_main->at(x, y, 0));
             math::Vec2d coords;
             c.fill(*coords);
-            if (coords[0] < 1 || coords[0] >= d_neig->width() - 1
-                || coords[1] < 1 || coords[1] >= d_neig->height() - 1)
+            if (coords[0] < cut || coords[0] >= d_neig->width() - cut
+                || coords[1] < cut || coords[1] >= d_neig->height() - cut)
             {
                 d_main->at(x, y, 0) = 0;
                 continue;
@@ -111,63 +123,68 @@ SGMStereo::run_sgm (float min_depth, float max_depth)
     return depth;
 }
 
-mve::Image<uint64_t>::Ptr
-SGMStereo::census_filter (mve::ByteImage::ConstPtr image)
+void
+SGMStereo::census_filter (mve::ByteImage::ConstPtr image,
+    mve::Image<uint64_t>::Ptr filtered)
 {
-    mve::Image<uint64_t>::Ptr filtered =
-        mve::Image<uint64_t>::create(image->width(), image->height(), 1);
     filtered->fill(0);
     for (int x = 4; x < image->width() - 5; ++x)
         for (int y = 3; y < image->height() - 4; ++y)
-        {
-            if (image->at(x, y, 0) == 0)
-                continue;
-
-            uint64_t census = 0;
-            for (int i = x - 4; i < x + 5; ++i)
-                for (int j = y - 3; j < y + 4; ++j)
-                {
-                    census *= 2;
-                    if (image->at(x, y, 0) < image->at(i, j, 0))
-                        census += 1;
-                }
-            filtered->at(x, y, 0) = census;
-        }
-    return filtered;
+            for (int d = 0; d < image->channels(); ++d)
+            {
+                if (image->at(x, y, d) == 0)
+                    continue;
+                uint8_t threshold = image->at(x, y, d);
+                uint64_t census = 0;
+                for (int i = x - 4; i < x + 5; ++i)
+                    for (int j = y - 3; j < y + 4; ++j)
+                    {
+                        census *= 2;
+                        if (threshold < image->at(i, j, d))
+                            census += 1;
+                    }
+                filtered->at(x, y, d) = census;
+            }
 }
 
 void
-SGMStereo::warped_l_image_for_depth (float depth, mve::ByteImage::Ptr image)
+SGMStereo::warped_neighbors_for_depth (std::vector<float> const& depths,
+    mve::ByteImage::Ptr image)
 {
-    mve::ByteImage::ConstPtr l_image = this->left->get_byte_image();
-    for (int i = 0; i < this->opts.scale; ++i)
-        l_image = mve::image::rescale_half_size<uint8_t>(l_image);
-
     math::Matrix3f M;
     math::Vec3f t;
-    mve::CameraInfo l_cam = this->left->get_camera();
-    this->right->get_camera().fill_reprojection(l_cam,
-        this->r_image->width(), this->r_image->height(),
-        l_image->width(), l_image->height(), *M, *t);
 
+    mve::CameraInfo n_cam = this->neighbor->get_camera();
+    this->main->get_camera().fill_reprojection(n_cam,
+        this->main_image->width(), this->main_image->height(),
+        this->neighbor_image->width(), this->neighbor_image->height(), *M, *t);
+
+    image->fill(0);
     for (int x = 0; x < image->width(); ++x)
         for (int y = 0; y < image->height(); ++y)
         {
-            math::Vec3d target_pixel(0.5f + x, 0.5f + y, 1.f);
-            math::Vec3d projected = M * target_pixel * depth + t;
-            projected[0] /= projected[2];
-            projected[1] /= projected[2];
-            projected[0] -= 0.5f;
-            projected[1] -= 0.5f;
+            math::Vec3f target_pixel(0.5f + x, 0.5f + y, 1.f);
+            target_pixel = M * target_pixel;
 
-            if (projected[0] < 0 || projected[1] < 0
-                || projected[0] > l_image->width() - 1
-                || projected[1] > l_image->height() - 1)
+            for (int d = 0; d < image->channels(); ++d)
             {
-                image->at(x,y,0) = 0;
-            } else {
-                image->at(x,y,0) =
-                    l_image->linear_at(projected[0], projected[1], 0);
+                math::Vec3f projected = target_pixel * depths[d] + t;
+
+                if (projected[2] < 0)
+                    continue;
+
+                projected[0] /= projected[2];
+                projected[1] /= projected[2];
+                projected[0] -= 0.5f;
+                projected[1] -= 0.5f;
+
+                if (projected[0] < 0 || projected[1] < 0
+                    || projected[0] > this->neighbor_image->width() - 1
+                    || projected[1] > this->neighbor_image->height() - 1)
+                    continue;
+
+                image->at(x,y,d) = this->neighbor_image->linear_at(
+                        projected[0], projected[1], 0);
             }
         }
 }
@@ -185,39 +202,37 @@ SGMStereo::create_cost_volume (float min_depth, float max_depth, int num_steps)
         inv_depth += increment;
     }
 
-    mve::ByteImage::Ptr l_warped = mve::ByteImage::create(
-        this->r_image->width(), this->r_image->height(), 1);
-    mve::Image<uint64_t>::Ptr l_warped_census;
-    mve::Image<uint64_t>::Ptr r_census = this->census_filter(this->r_image);
-
+    mve::ByteImage::Ptr n_warped = mve::ByteImage::create(
+        this->main_image->width(), this->main_image->height(), num_steps);
+    mve::Image<uint64_t>::Ptr n_warped_census = mve::Image<uint64_t>::create(
+        n_warped->width(), n_warped->height(), num_steps);
+    mve::Image<uint64_t>::Ptr main_census = mve::Image<uint64_t>::create(
+        main_image->width(), main_image->height(), 1);
+    this->census_filter(main_image, main_census);
 
 #if SMVS_ENABLE_SSE && defined(__SSE4_1__)
-    std::size_t const volume_size = r_census->width() * r_census->height() *
-        num_steps;
+    std::size_t const volume_size = main_census->width() *
+        main_census->height() * num_steps;
     this->sse_cost_volume.resize(volume_size, 256);
 #else
     this->cost_volume = mve::ByteImage::create(
-        r_census->width(), r_census->height(), num_steps);
+        main_census->width(), main_census->height(), num_steps);
         this->cost_volume->fill(255);
 #endif
 
-    for (int i = 0; i < num_steps; ++i)
+    this->warped_neighbors_for_depth(this->cost_volume_depths, n_warped);
+    this->census_filter(n_warped, n_warped_census);
+    
+    for (int p = 0; p < main_census->get_pixel_amount(); ++p)
     {
-        this->warped_l_image_for_depth(this->cost_volume_depths[i], l_warped);
-        l_warped_census = this->census_filter(l_warped);
-        for (int p = 0; p < r_census->get_pixel_amount(); ++p)
+        for (int i = 0; i < num_steps; ++i)
         {
-            if (l_warped->at(p) == 0)
+            if (n_warped->at(p, i) == 0)
                 continue;
 
             /* hamming distance between census values */
-            uint64_t c = r_census->at(p) ^ l_warped_census->at(p);
-            uint8_t count = 0;
-            while (c != 0)
-            {
-                c &= (c - 1);
-                count += 1;
-            }
+            uint8_t count = _mm_popcnt_u64(
+                main_census->at(p) ^ n_warped_census->at(p, i));
 
 #if SMVS_ENABLE_SSE && defined(__SSE4_1__)
             this->sse_cost_volume.at(p * num_steps + i) = count;
@@ -232,7 +247,7 @@ mve::FloatImage::Ptr
 SGMStereo::depth_from_cost_volume (void)
 {
     mve::FloatImage::Ptr depthmap = mve::FloatImage::create(
-        this->right->get_width(), this->right->get_height(), 1);
+        this->main->get_width(), this->main->get_height(), 1);
 
     for (int y = 0, p = 0; y < depthmap->height(); ++y)
         for (int x = 0; x < depthmap->width(); ++x, ++p)
@@ -260,7 +275,7 @@ mve::FloatImage::Ptr
 SGMStereo::depth_from_sgm_volume (void)
 {
     mve::FloatImage::Ptr depthmap = mve::FloatImage::create(
-        this->r_image->width(), this->r_image->height(), 1);
+        this->main_image->width(), this->main_image->height(), 1);
 
     int const num_steps = this->opts.num_steps;
 
@@ -282,7 +297,7 @@ SGMStereo::depth_from_sgm_volume (void)
                     min_index = i;
                 }
             }
-            if(min_index < 2 || this->r_image->at(p) < 25)
+            if(min_index < 2 || this->main_image->at(p) < 25)
                 depthmap->at(p) = 0;
             else
                 depthmap->at(p) = this->cost_volume_depths[min_index];
@@ -296,8 +311,8 @@ SGMStereo::fill_path_cost(int x, int y, int px, int py, mve::RawImage::Ptr path)
 {
     int const num_steps = path->channels();
 
-    int i1 = this->r_image->at(x, y, 0);
-    int i2 = this->r_image->at(px, py, 0);
+    int i1 = this->main_image->at(x, y, 0);
+    int i2 = this->main_image->at(px, py, 0);
     uint16_t diff = std::abs(i1 - i2) + 1;
     uint16_t const penalty1 = this->opts.penalty1;
     uint16_t const penalty2 = std::max(penalty1 * 3 / 2,
@@ -348,8 +363,8 @@ SGMStereo::fill_path_cost_sse (int base, int pbase,
         util::AlignedMemory<uint16_t> * path)
 {
     int const d_stride = this->opts.num_steps;
-    int i1 = this->r_image->at(base / d_stride);
-    int i2 = this->r_image->at(pbase / d_stride);
+    int i1 = this->main_image->at(base / d_stride);
+    int i2 = this->main_image->at(pbase / d_stride);
     uint16_t diff = std::abs(i1 - i2) + 1;
     uint16_t const penalty1 = this->opts.penalty1;
     uint16_t const penalty2 = std::max(penalty1 * 3 / 2,
@@ -418,12 +433,12 @@ SGMStereo::copy_cost_and_add_to_sgm(util::AlignedMemory<uint16_t> *local_volume,
 void
 SGMStereo::aggregate_sgm_costs (void)
 {
-    int const width = this->r_image->width();
-    int const height = this->r_image->height();
+    int const width = this->main_image->width();
+    int const height = this->main_image->height();
 
 #if SMVS_ENABLE_SSE && defined(__SSE4_1__)
     int const d_stride = this->opts.num_steps;
-    int const y_stride = this->r_image->width();
+    int const y_stride = this->main_image->width();
     this->sse_sgm_volume.resize(this->sse_cost_volume.size(), 0);
     this->mins.resize(8);
     util::AlignedMemory<uint16_t> sse_local_volume(

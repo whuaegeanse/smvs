@@ -15,30 +15,27 @@ SMVS_NAMESPACE_BEGIN
 
 StereoView::StereoView (mve::View::Ptr view,
     std::string const& image_embedding)
-    : view(view), image_embedding(image_embedding)
+    : view(view), image_embedding(image_embedding), debug(nullptr)
 {
     this->image = mve::image::byte_to_float_image(
         this->view->get_byte_image(this->image_embedding));
-    /* use only for debug */
-#if SMVS_DEBUG
-    this->debug = mve::FloatImage::create(this->image->width(),
-        this->image->height(), 3);
-#endif
 }
 
 void
 StereoView::set_scale(int scale, bool debug)
 {
-    mve::FloatImage::Ptr fimage = this->image->duplicate();
+    this->scaleimage = this->image->duplicate();
 
     double sigma = 0.12 * std::pow(2.0, scale) + 0.2;
-    fimage = mve::image::blur_gaussian<float>(fimage, sigma);
+    this->scaleimage = mve::image::blur_gaussian<float>(
+        this->scaleimage, sigma);
 
-    this->initialize_image_gradients(fimage);
+    this->initialize_image_gradients(this->scaleimage);
 
     if (debug)
     {
-        mve::ByteImage::Ptr blur = mve::image::float_to_byte_image(fimage);
+        mve::ByteImage::Ptr blur = mve::image::float_to_byte_image(
+            this->scaleimage);
         this->view->set_image(blur, "smvs-image");
         this->view->set_image(this->image_grad, "smvs-gradients");
         this->view->set_image(this->image_hessian, "smvs-hessian");
@@ -67,31 +64,34 @@ StereoView::initialize_image_gradients (mve::FloatImage::ConstPtr image)
 void
 StereoView::initialize_linear (bool gamma_correction)
 {
-    this->linear_image = mve::image::desaturate<float>(this->image,
-        mve::image::DESATURATE_LUMINANCE);
+    this->linear_image = this->image->duplicate();
 
     if (gamma_correction)
+    {
         mve::image::gamma_correct_inv_srgb<float>(this->linear_image);
+        this->view->set_image(this->linear_image, "smvs-linear");
+    }
 
-    this->linear_grad = mve::FloatImage::create(this->linear_image->width(),
+    if(this->linear_image->channels() > 1)
+        this->shading = mve::image::desaturate<float>(this->linear_image,
+            mve::image::DESATURATE_LUMINANCE);
+    else
+        this->shading = this->linear_image;
+
+    this->shading_grad = mve::FloatImage::create(this->linear_image->width(),
         this->linear_image->height(), 2);
-    this->compute_gradients_and_hessian(this->linear_image, this->linear_grad);
-}
-
-mve::FloatImage::Ptr
-StereoView::get_shading_image (void)
-{
-    mve::FloatImage::Ptr shading = this->linear_image->duplicate();
-    return shading;
+    this->compute_gradients_and_hessian(this->shading, this->shading_grad);
 }
 
 mve::ByteImage::ConstPtr
 StereoView::get_byte_image (void) const
 {
-    mve::ByteImage::Ptr image =
+    mve::ByteImage::Ptr byte_image =
         this->view->get_byte_image(this->image_embedding);
-    return mve::image::desaturate<uint8_t>(image,
-        mve::image::DESATURATE_LUMINANCE);
+    if(byte_image->channels() > 1)
+        byte_image = mve::image::desaturate<uint8_t>(byte_image,
+            mve::image::DESATURATE_LUMINANCE);
+    return byte_image;
 }
 
 void
